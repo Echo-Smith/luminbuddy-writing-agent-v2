@@ -1,0 +1,773 @@
+package profile
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/luminbuddy/writing-agent-v2/internal/database"
+	"github.com/luminbuddy/writing-agent-v2/internal/routing"
+)
+
+// StyleProfile is a complete style configuration.
+type StyleProfile struct {
+	Slug             string          `json:"slug"`
+	Name             string          `json:"name"`
+	Description      string          `json:"description"`
+	Version          int             `json:"version"`
+	Tags             []string        `json:"tags"`
+	WordRange        WordRange       `json:"word_range"`
+	Structure        Structure       `json:"structure"`
+	Rhetoric         Rhetoric        `json:"rhetoric"`
+	ValueOrientation ValueOrientation `json:"value_orientation"`
+	TitleGuidelines  TitleGuidelines `json:"title_guidelines"`
+	SystemPrompt     string          `json:"system_prompt"`
+	WritingStandard  string          `json:"writing_standard"`
+	FactGuard        FactGuard       `json:"fact_guard"`
+	OutputFormat     OutputFormat    `json:"output_format"`
+	LengthProfiles   map[string]WordRange `json:"length_profiles"`
+}
+
+type WordRange struct {
+	Min       int  `json:"min"`
+	Max       int  `json:"max"`
+	HardLimit bool `json:"hard_limit"`
+}
+
+type Structure struct {
+	Type           string      `json:"type"` // three_part | free_form | custom
+	Opening        string      `json:"opening"`
+	Body           string      `json:"body"`
+	Conclusion     string      `json:"conclusion"`
+	ArgumentPattern string     `json:"argument_pattern"`
+	ArgumentCount  CountRange  `json:"argument_count"`
+}
+
+type CountRange struct {
+	Min int `json:"min"`
+	Max int `json:"max"`
+}
+
+type Rhetoric struct {
+	RequiredMetaphor            bool   `json:"required_metaphor"`
+	RequiredParallelism         bool   `json:"required_parallelism"`
+	RequiredRhetoricalQuestion  bool   `json:"required_rhetorical_question"`
+	MetaphorDescription         string `json:"metaphor_description"`
+}
+
+type ValueOrientation struct {
+	Type             string   `json:"type"`
+	EmotionalGradient string  `json:"emotional_gradient"`
+	Keywords         []string `json:"keywords"`
+}
+
+type TitleGuidelines struct {
+	Length           CountRange `json:"length"`
+	Style            string     `json:"style"`
+	ForbiddenPatterns []string  `json:"forbidden_patterns"`
+	Examples         []string   `json:"examples"`
+}
+
+type FactGuard struct {
+	FutureTenseRequired []string `json:"future_tense_required"`
+	ForbiddenResults    []string `json:"forbidden_results"`
+	UserMaterialPriority bool    `json:"user_material_priority"`
+}
+
+type OutputFormat struct {
+	UseMarkdown          bool   `json:"use_markdown"`
+	TitlePrefix          string `json:"title_prefix"`
+	Separator            string `json:"separator"`
+	IncludeModificationNotes bool `json:"include_modification_notes"`
+	NoteLabel            string `json:"note_label"`
+}
+
+// StyleOption is the summary shown in the style picker.
+type StyleOption struct {
+	Slug        string   `json:"slug"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Version     int      `json:"version"`
+	WordRange   [2]int   `json:"word_range"`
+	Tags        []string `json:"tags"`
+}
+
+// AdminProfileInfo is the admin-facing profile info (includes status and metadata).
+type AdminProfileInfo struct {
+	Slug        string   `json:"slug"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Version     int      `json:"version"`
+	Status      string   `json:"status"` // published | draft | archived
+	Tags        []string `json:"tags"`
+	WordRange   [2]int   `json:"word_range"`
+	CreatedAt   string   `json:"created_at"`
+	UpdatedAt   string   `json:"updated_at"`
+}
+
+// Loader loads style profiles with caching.
+type Loader struct {
+	profiles map[string]*StyleProfile
+	mu       sync.RWMutex
+	ttl      time.Duration
+	lastLoad time.Time
+
+	// Profile statuses (slug → status)
+	statuses map[string]string
+
+	// Rollout configs (slug → RolloutConfig)
+	rolloutConfigs map[string]routing.RolloutConfig
+
+	// DB connection (optional — if nil, uses built-in profiles only)
+	db *database.DB
+
+	// fallbackCache caches fallback version profiles loaded from DB (LRU)
+	fallbackCache *profileLRUCache
+
+	// PublishHook is called when a profile is published (for auto-evaluation trigger)
+	PublishHook func(slug string, version int, detail string)
+}
+
+// NewLoader creates a new profile loader with built-in profiles.
+func NewLoader() *Loader {
+	l := &Loader{
+		profiles:       getBuiltinProfiles(),
+		statuses:       make(map[string]string),
+		rolloutConfigs: make(map[string]routing.RolloutConfig),
+		ttl:            5 * time.Minute,
+		fallbackCache:  newProfileLRUCache(64),
+	}
+	// Mark built-in profiles as published with full rollout
+	for slug := range l.profiles {
+		l.statuses[slug] = "published"
+		l.rolloutConfigs[slug] = routing.RolloutConfig{
+			Type:           "full",
+			RolloutPercent: 100,
+		}
+	}
+	return l
+}
+
+// WithDB sets the database connection and attempts to load profiles from DB.
+// If the DB has no profiles, it seeds the built-in profiles first.
+func (l *Loader) WithDB(db *database.DB) *Loader {
+	l.db = db
+	if db != nil {
+		l.LoadFromDB()
+	}
+	return l
+}
+
+// LoadFromDB reads all style profiles from the database and replaces
+// the in-memory cache. If the DB has no profiles, it seeds built-in profiles.
+func (l *Loader) LoadFromDB() {
+	if l.db == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := l.db.QueryContext(ctx, `
+		SELECT slug, name, description, version, status, config,
+		       rollout_type, whitelist_uids, rollout_percent
+		FROM style_profiles
+		ORDER BY updated_at DESC
+	`)
+	if err != nil {
+		slog.Warn("failed to load profiles from DB, using built-in", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	dbProfiles := make(map[string]*StyleProfile)
+	dbStatuses := make(map[string]string)
+	dbRolloutConfigs := make(map[string]routing.RolloutConfig)
+
+	for rows.Next() {
+		var (
+			slug            string
+			name            string
+			description     string
+			version         int
+			status          string
+			configJSON      []byte
+			rolloutType     string
+			whitelistUIDs   []string
+			rolloutPercent  int
+		)
+
+		if err := rows.Scan(&slug, &name, &description, &version, &status,
+			&configJSON, &rolloutType, &whitelistUIDs, &rolloutPercent); err != nil {
+			slog.Warn("failed to scan profile row", "error", err)
+			continue
+		}
+
+		var p StyleProfile
+		if err := json.Unmarshal(configJSON, &p); err != nil {
+			slog.Warn("failed to unmarshal profile config", "slug", slug, "error", err)
+			continue
+		}
+
+		// Ensure slug matches
+		if p.Slug == "" {
+			p.Slug = slug
+		}
+		if p.Name == "" {
+			p.Name = name
+		}
+		if p.Description == "" {
+			p.Description = description
+		}
+		if p.Version == 0 {
+			p.Version = version
+		}
+
+		dbProfiles[slug] = &p
+		dbStatuses[slug] = status
+
+		// Store rollout config
+		dbRolloutConfigs[slug] = routing.RolloutConfig{
+			Type:           rolloutType,
+			WhitelistUIDs:  whitelistUIDs,
+			RolloutPercent: rolloutPercent,
+		}
+	}
+
+	if len(dbProfiles) == 0 {
+		// DB is empty — seed built-in profiles
+		slog.Info("no profiles in DB, seeding built-in profiles")
+		l.seedBuiltinToDB(ctx)
+		return
+	}
+
+	l.mu.Lock()
+	l.profiles = dbProfiles
+	l.statuses = dbStatuses
+	l.rolloutConfigs = dbRolloutConfigs
+	l.lastLoad = time.Now()
+	l.mu.Unlock()
+
+	slog.Info("profiles loaded from DB", "count", len(dbProfiles))
+}
+
+// seedBuiltinToDB writes the built-in profiles to the database.
+func (l *Loader) seedBuiltinToDB(ctx context.Context) {
+	builtins := getBuiltinProfiles()
+
+	l.mu.Lock()
+	l.profiles = builtins
+	for slug := range builtins {
+		l.statuses[slug] = "published"
+	}
+	l.mu.Unlock()
+
+	for slug, p := range builtins {
+		configJSON, _ := json.Marshal(p)
+		_, err := l.db.ExecContext(ctx, `
+			INSERT INTO style_profiles (id, slug, name, description, version, status, config,
+				rollout_type, whitelist_uids, rollout_percent,
+				published_at, published_by, created_at, updated_at)
+			VALUES (uuid_generate_v4(), $1, $2, $3, $4, 'published', $5,
+				'full', '{}', 100, NOW(), 'system', NOW(), NOW())
+			ON CONFLICT (slug) DO NOTHING
+		`, slug, p.Name, p.Description, p.Version, string(configJSON))
+		if err != nil {
+			slog.Warn("failed to seed profile to DB", "slug", slug, "error", err)
+		} else {
+			slog.Info("seeded profile to DB", "slug", slug, "version", p.Version)
+		}
+
+		// Also create a version record
+		_, _ = l.db.ExecContext(ctx, `
+			INSERT INTO profile_versions (id, profile_slug, version, config, changelog, status, published_at, created_at, created_by)
+			VALUES (uuid_generate_v4(), $1, $2, $3, 'Initial seed', 'published', NOW(), NOW(), 'system')
+			ON CONFLICT (profile_slug, version) DO NOTHING
+		`, slug, p.Version, string(configJSON))
+	}
+}
+
+// maybeRefresh checks if the cache TTL has expired and refreshes from DB.
+func (l *Loader) maybeRefresh() {
+	if l.db == nil {
+		return
+	}
+	if time.Since(l.lastLoad) < l.ttl {
+		return
+	}
+	go l.LoadFromDB()
+}
+
+// Publish marks a profile as published, persists to DB, and triggers the publish hook.
+func (l *Loader) Publish(slug string, version int, detail string) error {
+	l.mu.Lock()
+	p, ok := l.profiles[slug]
+	if !ok {
+		l.mu.Unlock()
+		return fmt.Errorf("profile not found: %s", slug)
+	}
+
+	p.Version = version
+	if p.Version == 0 {
+		p.Version = 1
+	}
+	p.Version = version
+
+	// Update status in memory
+	l.statuses[slug] = "published"
+
+	// Invalidate cached fallback versions for this slug
+	l.fallbackCache.InvalidateSlug(slug)
+
+	// Persist to DB if available
+	var dbErr error
+	if l.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		configJSON, _ := json.Marshal(p)
+
+		// Update style_profiles table
+		_, err := l.db.ExecContext(ctx, `
+			UPDATE style_profiles
+			SET version = $2, status = 'published', config = $3,
+			    published_at = NOW(), updated_at = NOW()
+			WHERE slug = $1
+		`, slug, p.Version, string(configJSON))
+		if err != nil {
+			slog.Warn("failed to update style_profiles on publish", "slug", slug, "error", err)
+			dbErr = err
+		} else {
+			// Insert into profile_versions table
+			changelog := detail
+			if changelog == "" {
+				changelog = fmt.Sprintf("Published version %d", p.Version)
+			}
+			_, err = l.db.ExecContext(ctx, `
+				INSERT INTO profile_versions (id, profile_slug, version, config, changelog, status, published_at, created_at, created_by)
+				VALUES (uuid_generate_v4(), $1, $2, $3, $4, 'published', NOW(), NOW(), 'system')
+				ON CONFLICT (profile_slug, version) DO UPDATE SET
+					config = EXCLUDED.config,
+					changelog = EXCLUDED.changelog,
+					status = 'published',
+					published_at = NOW()
+			`, slug, p.Version, string(configJSON), changelog)
+			if err != nil {
+				slog.Warn("failed to insert profile_version on publish", "slug", slug, "error", err)
+				dbErr = err
+			}
+		}
+	}
+
+	l.mu.Unlock()
+
+	slog.Info("profile published", "slug", slug, "version", version, "db_error", dbErr)
+
+	// Trigger publish hook (for auto-evaluation)
+	if l.PublishHook != nil {
+		go l.PublishHook(slug, version, detail)
+	}
+
+	return dbErr
+}
+
+// UpdateProfile updates a profile configuration in memory.
+func (l *Loader) UpdateProfile(slug string, config *StyleProfile) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.profiles[slug] = config
+	// Invalidate any cached fallback versions for this slug
+	l.fallbackCache.InvalidateSlug(slug)
+	slog.Info("profile updated", "slug", slug, "version", config.Version)
+}
+
+// CreateProfile creates a new profile in memory.
+func (l *Loader) CreateProfile(config *StyleProfile) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if config.Slug == "" {
+		return fmt.Errorf("slug is required")
+	}
+	if _, exists := l.profiles[config.Slug]; exists {
+		return fmt.Errorf("profile with slug '%s' already exists", config.Slug)
+	}
+
+	l.profiles[config.Slug] = config
+	l.statuses[config.Slug] = "draft"
+	slog.Info("profile created", "slug", config.Slug, "name", config.Name)
+	return nil
+}
+
+// ArchiveProfile marks a profile as archived.
+func (l *Loader) ArchiveProfile(slug string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.statuses[slug] = "archived"
+	slog.Info("profile archived", "slug", slug)
+}
+
+// GetStatus returns the status of a profile.
+func (l *Loader) GetStatus(slug string) string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if status, ok := l.statuses[slug]; ok {
+		return status
+	}
+	return "published"
+}
+
+// ListAll returns all profiles with admin metadata (including drafts).
+func (l *Loader) ListAll() []AdminProfileInfo {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	result := make([]AdminProfileInfo, 0, len(l.profiles))
+	for _, p := range l.profiles {
+		status := "published"
+		if s, ok := l.statuses[p.Slug]; ok {
+			status = s
+		}
+		result = append(result, AdminProfileInfo{
+			Slug:        p.Slug,
+			Name:        p.Name,
+			Description: p.Description,
+			Version:     p.Version,
+			Status:      status,
+			Tags:        p.Tags,
+			WordRange:   [2]int{p.WordRange.Min, p.WordRange.Max},
+		})
+	}
+	return result
+}
+
+// GetDetail returns the full profile configuration.
+func (l *Loader) GetDetail(slug string) (*StyleProfile, bool) {
+	return l.Get(slug)
+}
+
+// Get returns the profile for the given slug. Falls back to "yinyue" if not found.
+func (l *Loader) Get(slug string) (*StyleProfile, bool) {
+	l.maybeRefresh()
+
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if p, ok := l.profiles[slug]; ok {
+		return p, true
+	}
+
+	// Fallback to yinyue
+	if p, ok := l.profiles["yinyue"]; ok {
+		slog.Warn("style profile not found, falling back to yinyue", "requested", slug)
+		return p, true
+	}
+
+	return nil, false
+}
+
+// GetForUser returns the profile for the given slug, applying grayscale routing.
+// If the user is selected for the new version, they get the current profile.
+// Otherwise, they get the fallback version (if configured).
+func (l *Loader) GetForUser(slug, userID string) (*StyleProfile, bool) {
+	l.maybeRefresh()
+
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	p, ok := l.profiles[slug]
+	if !ok {
+		// Fallback to yinyue
+		if p, ok := l.profiles["yinyue"]; ok {
+			slog.Warn("style profile not found, falling back to yinyue", "requested", slug)
+			return p, true
+		}
+		return nil, false
+	}
+
+	// If no user ID, return the profile as-is (anonymous user)
+	if userID == "" || userID == "anonymous" {
+		return p, true
+	}
+
+	// Check rollout config
+	config, hasConfig := l.rolloutConfigs[slug]
+	if !hasConfig {
+		return p, true // Default: full rollout
+	}
+
+	// If full rollout or user is selected, return current version
+	if routing.ShouldUseNewVersion(userID, config) {
+		return p, true
+	}
+
+	// User is not selected — try to load the fallback version from DB
+	if config.FallbackVersion > 0 && config.FallbackVersion < p.Version && l.db != nil {
+		// Check LRU cache first
+		if cached, ok := l.fallbackCache.Get(slug, config.FallbackVersion); ok {
+			slog.Debug("serving fallback profile from LRU cache",
+				"slug", slug, "user", userID,
+				"current_version", p.Version, "fallback_version", config.FallbackVersion)
+			return cached, true
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var configJSON []byte
+		err := l.db.QueryRowContext(ctx, `
+			SELECT config FROM profile_versions
+			WHERE profile_slug = $1 AND version = $2 AND status = 'published'
+		`, slug, config.FallbackVersion).Scan(&configJSON)
+		if err == nil && len(configJSON) > 0 {
+			var fallback StyleProfile
+			if json.Unmarshal(configJSON, &fallback) == nil {
+				if fallback.Slug == "" {
+					fallback.Slug = slug
+				}
+				// Cache for future lookups
+				l.fallbackCache.Put(slug, config.FallbackVersion, &fallback)
+				slog.Info("serving fallback profile version",
+					"slug", slug, "user", userID,
+					"current_version", p.Version, "fallback_version", config.FallbackVersion)
+				return &fallback, true
+			}
+		}
+	}
+
+	// If fallback fails, return current version (fail open)
+	return p, true
+}
+
+// GetRolloutConfig returns the rollout configuration for a profile.
+func (l *Loader) GetRolloutConfig(slug string) routing.RolloutConfig {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if config, ok := l.rolloutConfigs[slug]; ok {
+		return config
+	}
+	return routing.RolloutConfig{
+		Type:           "full",
+		RolloutPercent: 100,
+	}
+}
+
+// UpdateRolloutConfig updates the rollout configuration for a profile in memory and DB.
+func (l *Loader) UpdateRolloutConfig(slug string, config routing.RolloutConfig) error {
+	l.mu.Lock()
+	l.rolloutConfigs[slug] = config
+	l.mu.Unlock()
+
+	if l.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		_, err := l.db.ExecContext(ctx, `
+			UPDATE style_profiles
+			SET rollout_type = $2, whitelist_uids = $3, rollout_percent = $4, updated_at = NOW()
+			WHERE slug = $1
+		`, slug, config.Type, config.WhitelistUIDs, config.RolloutPercent)
+		if err != nil {
+			slog.Warn("failed to persist rollout config", "slug", slug, "error", err)
+			return err
+		}
+	}
+
+	slog.Info("rollout config updated", "slug", slug, "type", config.Type, "percent", config.RolloutPercent)
+	return nil
+}
+
+// List returns all available profiles as StyleOptions.
+func (l *Loader) List() []StyleOption {
+	l.maybeRefresh()
+
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	options := make([]StyleOption, 0, len(l.profiles))
+	for _, p := range l.profiles {
+		options = append(options, StyleOption{
+			Slug:        p.Slug,
+			Name:        p.Name,
+			Description: p.Description,
+			Version:     p.Version,
+			WordRange:   [2]int{p.WordRange.Min, p.WordRange.Max},
+			Tags:        p.Tags,
+		})
+	}
+	return options
+}
+
+// getBuiltinProfiles returns the built-in style profiles.
+func getBuiltinProfiles() map[string]*StyleProfile {
+	yinyueJSON := `{
+		"slug": "yinyue",
+		"name": "印月三谈",
+		"description": "植根于杭州时评专栏的深度评论风格",
+		"version": 3,
+		"tags": ["政论", "民生", "深度评论"],
+		"word_range": {"min": 1000, "max": 1500, "hard_limit": true},
+		"structure": {
+			"type": "three_part",
+			"opening": "现象点题",
+			"body": "分层论述",
+			"conclusion": "总结升华",
+			"argument_pattern": "首在-重在-贵在",
+			"argument_count": {"min": 2, "max": 4}
+		},
+		"rhetoric": {
+			"required_metaphor": true,
+			"required_parallelism": true,
+			"required_rhetorical_question": true,
+			"metaphor_description": "每篇文章围绕一个高频复现的核心比喻展开"
+		},
+		"value_orientation": {
+			"type": "people_livelihood",
+			"emotional_gradient": "关切→共情→温暖",
+			"keywords": ["细", "微", "暖", "柔", "盼"]
+		},
+		"title_guidelines": {
+			"length": {"min": 10, "max": 25},
+			"style": "判断式或设问式，禁止用伤亡数字、煽动性表述做标题",
+			"forbidden_patterns": ["\\d+人死亡", "\\d+人伤亡", "惨烈", "震惊", "沸腾"],
+			"examples": ["外卖骑手的红灯困境", "城市温度，从一条背篓专线说起"]
+		},
+		"system_prompt": "你是「印月三谈」写作助手，专注撰写政论时评。要求：\n1. 三段式结构（现象→分析→升华）\n2. 首在-重在-贵在 递进模式\n3. 核心比喻贯穿全文\n4. 排比+设问修辞\n5. 关注民生温度\n6. 标题不用伤亡数字\n7. 输出 Markdown 格式",
+		"writing_standard": "篇幅1000-1500字，标题10-25字，禁止使用伤亡数字做标题",
+		"fact_guard": {
+			"future_tense_required": ["将", "即将", "将于", "预计", "计划", "拟", "待"],
+			"forbidden_results": ["已夺冠", "夺得", "拿下", "完成", "传来捷报"],
+			"user_material_priority": true
+		},
+		"output_format": {
+			"use_markdown": true,
+			"title_prefix": "## ",
+			"separator": "---MODIFICATIONS---",
+			"include_modification_notes": true,
+			"note_label": "成文说明"
+		},
+		"length_profiles": {
+			"writing": {"min": 1000, "max": 1500, "hard_limit": true},
+			"polish_short": {"min": 100, "max": 600, "hard_limit": false},
+			"polish_long": {"min": 600, "max": 1200, "hard_limit": false}
+		}
+	}`
+
+	shenlunJSON := `{
+		"slug": "shenlun",
+		"name": "申论风格",
+		"description": "公务员申论写作风格",
+		"version": 1,
+		"tags": ["申论", "公考"],
+		"word_range": {"min": 800, "max": 1200, "hard_limit": true},
+		"structure": {
+			"type": "three_part",
+			"opening": "提出问题",
+			"body": "分析问题",
+			"conclusion": "解决问题",
+			"argument_pattern": "提出-分析-解决",
+			"argument_count": {"min": 2, "max": 3}
+		},
+		"rhetoric": {
+			"required_metaphor": false,
+			"required_parallelism": true,
+			"required_rhetorical_question": false,
+			"metaphor_description": ""
+		},
+		"value_orientation": {
+			"type": "governance",
+			"emotional_gradient": "理性→客观→建设性",
+			"keywords": ["规范", "制度", "治理", "协同"]
+		},
+		"title_guidelines": {
+			"length": {"min": 8, "max": 20},
+			"style": "概括式或对策式",
+			"forbidden_patterns": [],
+			"examples": ["以制度建设破解治理难题"]
+		},
+		"system_prompt": "你是申论写作助手。要求：\n1. 提出问题→分析问题→解决问题 三段结构\n2. 语言规范、政策引用准确\n3. 排比修辞增强气势\n4. 对策具有可操作性\n5. 输出 Markdown 格式",
+		"writing_standard": "篇幅800-1200字，结构严谨，对策可行",
+		"fact_guard": {
+			"future_tense_required": ["将", "拟", "计划"],
+			"forbidden_results": [],
+			"user_material_priority": true
+		},
+		"output_format": {
+			"use_markdown": true,
+			"title_prefix": "## ",
+			"separator": "---MODIFICATIONS---",
+			"include_modification_notes": false,
+			"note_label": ""
+		},
+		"length_profiles": {
+			"writing": {"min": 800, "max": 1200, "hard_limit": true}
+		}
+	}`
+
+	xiaohongshuJSON := `{
+		"slug": "xiaohongshu",
+		"name": "小红书风格",
+		"description": "轻松种草风格",
+		"version": 1,
+		"tags": ["社交媒体", "种草"],
+		"word_range": {"min": 300, "max": 800, "hard_limit": false},
+		"structure": {
+			"type": "free_form",
+			"opening": "吸引眼球的开头",
+			"body": "核心内容",
+			"conclusion": "互动引导",
+			"argument_pattern": "",
+			"argument_count": {"min": 1, "max": 3}
+		},
+		"rhetoric": {
+			"required_metaphor": false,
+			"required_parallelism": false,
+			"required_rhetorical_question": false,
+			"metaphor_description": ""
+		},
+		"value_orientation": {
+			"type": "custom",
+			"emotional_gradient": "好奇→惊喜→分享欲",
+			"keywords": ["宝藏", "绝了", "姐妹们"]
+		},
+		"title_guidelines": {
+			"length": {"min": 5, "max": 20},
+			"style": "口语化、带emoji",
+			"forbidden_patterns": [],
+			"examples": ["这家店也太绝了吧😭"]
+		},
+		"system_prompt": "你是小红书写作助手。要求：\n1. 口语化、轻松\n2. 适当使用emoji\n3. 短句为主\n4. 有互动引导\n5. 输出 Markdown 格式",
+		"writing_standard": "篇幅300-800字，轻松口语化",
+		"fact_guard": {
+			"future_tense_required": [],
+			"forbidden_results": [],
+			"user_material_priority": false
+		},
+		"output_format": {
+			"use_markdown": true,
+			"title_prefix": "# ",
+			"separator": "",
+			"include_modification_notes": false,
+			"note_label": ""
+		},
+		"length_profiles": {
+			"writing": {"min": 300, "max": 800, "hard_limit": false}
+		}
+	}`
+
+	profiles := make(map[string]*StyleProfile)
+	for _, jsonStr := range []string{yinyueJSON, shenlunJSON, xiaohongshuJSON} {
+		var p StyleProfile
+		if err := json.Unmarshal([]byte(jsonStr), &p); err != nil {
+			slog.Error("failed to parse builtin profile", "error", err)
+			continue
+		}
+		profiles[p.Slug] = &p
+	}
+
+	return profiles
+}
