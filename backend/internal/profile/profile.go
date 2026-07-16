@@ -815,7 +815,7 @@ func getBuiltinProfiles() map[string]*StyleProfile {
 		"writing_standard": "篇幅1000-1500字，标题10-25字，禁止使用伤亡数字做标题",
 		"fact_guard": {
 			"future_tense_required": ["将", "即将", "将于", "预计", "计划", "拟", "待"],
-			"forbidden_results": ["已夺冠", "夺得", "拿下", "完成", "传来捷报"],
+			"forbidden_results": ["已夺冠", "夺得", "拿下", "完成", "传来捷报", "摘得", "桂冠", "斩获", "包揽", "夺魁", "问鼎", "加冕", "封王", "登顶", "折桂"],
 			"user_material_priority": true
 		},
 		"output_format": {
