@@ -66,7 +66,7 @@ export function PrivacyPage() {
 
         <h2>6. Cookie 与本地存储</h2>
         <p>
-          本服务使用 localStorage 存储登录令牌（JWT）和用户偏好设置（如主题模式）。这些数据仅存储在你的浏览器本地，不会跨设备同步。
+          本服务使用 localStorage 存储登录令牌（JWT）和界面偏好（如主题模式）。写作编排模式等用户偏好通过云端同步，跟随你的账号。
         </p>
 
         <h2>7. 你的权利</h2>
