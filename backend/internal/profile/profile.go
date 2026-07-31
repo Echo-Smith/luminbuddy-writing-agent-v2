@@ -46,6 +46,8 @@ type Structure struct {
 	Body           string      `json:"body"`
 	Conclusion     string      `json:"conclusion"`
 	ArgumentPattern string     `json:"argument_pattern"`
+	ArgumentVariations []string `json:"argument_variations"`
+	ArgumentInstruction string  `json:"argument_instruction"`
 	ArgumentCount  CountRange  `json:"argument_count"`
 }
 
@@ -786,14 +788,16 @@ func getBuiltinProfiles() map[string]*StyleProfile {
 		"version": 3,
 		"tags": ["政论", "民生", "深度评论"],
 		"word_range": {"min": 1000, "max": 1500, "hard_limit": true},
-		"structure": {
-			"type": "three_part",
-			"opening": "现象点题",
-			"body": "分层论述",
-			"conclusion": "总结升华",
-			"argument_pattern": "首在-重在-贵在",
-			"argument_count": {"min": 2, "max": 4}
-		},
+	"structure": {
+		"type": "three_part",
+		"opening": "现象点题",
+		"body": "分层论述",
+		"conclusion": "总结升华",
+		"argument_pattern": "递进式论述（灵活变式）",
+		"argument_variations": ["首在-重在-贵在", "破-立-合", "是什么-为什么-怎么办", "现象-本质-对策", "起-承-转-合"],
+		"argument_instruction": "每篇文章从上述变式中灵活选择一种递进模式，切忌每篇都机械套用「首在-重在-贵在」三段口号式分论点。可根据选题特点自然展开，分论点之间应体现逻辑递进而非简单并列。",
+		"argument_count": {"min": 2, "max": 4}
+	},
 		"rhetoric": {
 			"required_metaphor": true,
 			"required_parallelism": true,
@@ -811,7 +815,7 @@ func getBuiltinProfiles() map[string]*StyleProfile {
 			"forbidden_patterns": ["\\d+人死亡", "\\d+人伤亡", "惨烈", "震惊", "沸腾"],
 			"examples": ["外卖骑手的红灯困境", "城市温度，从一条背篓专线说起"]
 		},
-		"system_prompt": "你是「印月三谈」写作助手，专注撰写政论时评。要求：\n1. 三段式结构（现象→分析→升华）\n2. 首在-重在-贵在 递进模式\n3. 核心比喻贯穿全文\n4. 排比+设问修辞\n5. 关注民生温度\n6. 标题不用伤亡数字\n7. 输出 Markdown 格式",
+		"system_prompt": "你是「印月三谈」写作助手，专注撰写政论时评。要求：\n1. 三段式结构（现象→分析→升华），但分论点的展开方式应灵活多变\n2. 递进式论述，可从「首在-重在-贵在」「破-立-合」「是什么-为什么-怎么办」「起-承-转-合」等模式中自然选择，切忌每篇都机械套用同一种三段口号\n3. 核心比喻贯穿全文\n4. 排比+设问修辞\n5. 关注民生温度\n6. 标题不用伤亡数字\n7. 输出 Markdown 格式",
 		"writing_standard": "篇幅1000-1500字，标题10-25字，禁止使用伤亡数字做标题",
 		"fact_guard": {
 			"future_tense_required": ["将", "即将", "将于", "预计", "计划", "拟", "待"],
