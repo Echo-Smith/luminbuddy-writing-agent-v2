@@ -3,6 +3,7 @@
  */
 import { ArrowLeft } from "lucide-react";
 import { Link } from "react-router-dom";
+import { BrandIcon } from "@/components/brand-icon";
 
 export function PrivacyPage() {
   return (
@@ -15,16 +16,14 @@ export function PrivacyPage() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Link>
-          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-brand-gradient shadow-sm">
-            <span className="text-sm font-bold text-white">笔</span>
-          </div>
+          <BrandIcon size="sm" />
           <span className="text-sm font-medium">隐私政策</span>
         </div>
       </header>
 
       <article className="prose-article mx-auto max-w-3xl px-6 py-12">
         <h1>隐私政策</h1>
-        <p className="text-sm text-muted-foreground">最后更新：2025 年 7 月 21 日</p>
+        <p className="text-sm text-muted-foreground">最后更新：2026 年 8 月 23 日</p>
 
         <h2>1. 信息收集</h2>
         <p>本服务收集以下类型的信息：</p>
@@ -89,7 +88,11 @@ export function PrivacyPage() {
         </p>
 
         <h2>10. 联系我们</h2>
-        <p>如对本隐私政策有任何疑问，请通过产品内反馈渠道与我们联系。</p>
+        <p>如对本隐私政策有任何疑问，请通过以下方式与我们联系：</p>
+        <ul>
+          <li><strong>邮箱</strong>：luminbuddy@ericdocmic.top</li>
+          <li><strong>产品内反馈</strong>：通过个人中心的反馈渠道提交意见。</li>
+        </ul>
       </article>
     </div>
   );
