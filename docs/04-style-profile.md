@@ -15,7 +15,7 @@
 {
   "slug": "yinyue",
   "name": "印月三谈",
-  "description": "植根于杭州时评专栏的深度评论风格",
+  "description": "植根于时评专栏的深度评论风格",
   "version": 3,
   "tags": ["政论", "民生", "深度评论"],
 

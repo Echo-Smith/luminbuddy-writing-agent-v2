@@ -33,6 +33,12 @@ type StyleProfile struct {
 	FactGuard        FactGuard       `json:"fact_guard"`
 	OutputFormat     OutputFormat    `json:"output_format"`
 	LengthProfiles   map[string]WordRange `json:"length_profiles"`
+
+	// KbID binds this style to a specific knowledge base.
+	// When non-empty, the search_knowledge tool will scope its search
+	// to this KB (via HybridSearchInKB). When empty, searches all KBs.
+	// Example: "default" for the built-in 印月三谈 article library.
+	KbID             string          `json:"kb_id,omitempty"`
 }
 
 type WordRange struct {
@@ -50,6 +56,18 @@ type Structure struct {
 	ArgumentVariations []string `json:"argument_variations"`
 	ArgumentInstruction string  `json:"argument_instruction"`
 	ArgumentCount  CountRange  `json:"argument_count"`
+	// Sections 是自定义结构段列表，用于 custom 类型。
+	// 当 Type == "custom" 时，Sections 优先于 Opening/Body/Conclusion。
+	// 每个 SectionPart 代表一个结构骨架节点（如：引言→方法→实验→讨论→结论）。
+	Sections       []SectionPart `json:"sections,omitempty"`
+}
+
+// SectionPart 表示一个自定义结构段。
+// Name 是段的显示名称（如"引言""方法""实验""讨论""结论"）。
+// Description 是可选的写作指引（如"概述研究背景与问题"）。
+type SectionPart struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
 type CountRange struct {
@@ -438,6 +456,14 @@ func ValidateProfile(p *StyleProfile) error {
 	if !validStructures[p.Structure.Type] {
 		return fmt.Errorf("structure.type '%s' is not valid (must be three_part, free_form, or custom)", p.Structure.Type)
 	}
+	// Rule 4b: custom type should have at least one section in Sections
+	if p.Structure.Type == "custom" && len(p.Structure.Sections) > 0 {
+		for i, s := range p.Structure.Sections {
+			if s.Name == "" {
+				return fmt.Errorf("structure.sections[%d].name must not be empty", i)
+			}
+		}
+	}
 	return nil
 }
 
@@ -793,7 +819,7 @@ func getBuiltinProfiles() map[string]*StyleProfile {
 	yinyueJSON := `{
 		"slug": "yinyue",
 		"name": "印月三谈",
-		"description": "植根于杭州时评专栏的深度评论风格",
+		"description": "植根于时评专栏的深度评论风格",
 		"version": 3,
 		"tags": ["政论", "民生", "深度评论"],
 		"word_range": {"min": 1000, "max": 1500, "hard_limit": true},
@@ -824,7 +850,7 @@ func getBuiltinProfiles() map[string]*StyleProfile {
 			"forbidden_patterns": ["\\d+人死亡", "\\d+人伤亡", "惨烈", "震惊", "沸腾"],
 			"examples": ["外卖骑手的红灯困境", "城市温度，从一条背篓专线说起"]
 		},
-		"system_prompt": "你是「印月三谈」写作助手，专注撰写政论时评。要求：\n1. 三段式结构（现象→分析→升华），但分论点的展开方式应灵活多变\n2. 递进式论述，可从「首在-重在-贵在」「破-立-合」「是什么-为什么-怎么办」「起-承-转-合」等模式中自然选择，切忌每篇都机械套用同一种三段口号\n3. 核心比喻贯穿全文\n4. 排比+设问修辞\n5. 关注民生温度\n6. 标题不用伤亡数字\n7. 输出 Markdown 格式",
+		"system_prompt": "你是「印月三谈」写作助手，专注撰写政论时评。要求：\n1. 结构化论述（现象→分析→升华），分论点的展开方式应灵活多变\n2. 递进式论述，可从「首在-重在-贵在」「破-立-合」「是什么-为什么-怎么办」「起-承-转-合」等模式中自然选择，切忌每篇都机械套用同一种三段口号\n3. 核心比喻贯穿全文\n4. 排比+设问修辞\n5. 关注民生温度\n6. 标题不用伤亡数字\n7. 输出 Markdown 格式",
 		"writing_standard": "篇幅1000-1500字，标题10-25字，禁止使用伤亡数字做标题",
 		"fact_guard": {
 			"future_tense_required": ["将", "即将", "将于", "预计", "计划", "拟", "待"],
@@ -842,7 +868,8 @@ func getBuiltinProfiles() map[string]*StyleProfile {
 			"writing": {"min": 1000, "max": 1500, "hard_limit": true},
 			"polish_short": {"min": 100, "max": 600, "hard_limit": false},
 			"polish_long": {"min": 600, "max": 1200, "hard_limit": false}
-		}
+		},
+		"kb_id": "default"
 	}`
 
 	shenlunJSON := `{
@@ -877,7 +904,7 @@ func getBuiltinProfiles() map[string]*StyleProfile {
 			"forbidden_patterns": [],
 			"examples": ["以制度建设破解治理难题"]
 		},
-		"system_prompt": "你是申论写作助手。要求：\n1. 提出问题→分析问题→解决问题 三段结构\n2. 语言规范、政策引用准确\n3. 排比修辞增强气势\n4. 对策具有可操作性\n5. 输出 Markdown 格式",
+		"system_prompt": "你是申论写作助手。要求：\n1. 提出问题→分析问题→解决问题 结构\n2. 语言规范、政策引用准确\n3. 排比修辞增强气势\n4. 对策具有可操作性\n5. 输出 Markdown 格式",
 		"writing_standard": "篇幅800-1200字，结构严谨，对策可行",
 		"fact_guard": {
 			"future_tense_required": ["将", "拟", "计划"],
